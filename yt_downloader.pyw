@@ -7,6 +7,7 @@
 import ctypes
 import json
 import os
+import shutil
 import socket
 import sys
 import threading
@@ -45,13 +46,33 @@ class QuietLogger:
         pass
 
 
+def find_deno():
+    """Путь к deno. Без него YouTube отдаёт урезанный список форматов.
+
+    Программа из автозапуска или открытая до установки deno может не видеть его в PATH,
+    поэтому заглядываем и туда, куда его ставит winget.
+    """
+    found = shutil.which("deno")
+    if found:
+        return found
+    winget = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet"
+    candidates = [winget / "Links" / "deno.exe", *winget.glob("Packages/DenoLand.Deno_*/deno.exe")]
+    return next((str(p) for p in candidates if p.is_file()), None)
+
+
+DENO = find_deno()
+
+
 def base_opts():
-    return {
+    opts = {
         "quiet": True,
         "noprogress": True,
         "noplaylist": True,
         "logger": QuietLogger(),
     }
+    if DENO:
+        opts["js_runtimes"] = {"deno": {"path": DENO}}
+    return opts
 
 
 def load_settings():
@@ -90,8 +111,8 @@ class App:
     def __init__(self, root, server, start_hidden):
         self.root = root
         self.heights = {}  # подпись в списке -> высота кадра
-        self.all_heights = []  # все высоты у проверенного видео
-        self.h264_heights = []  # высоты, которые есть в H.264 (YouTube отдаёт его максимум до 1080p)
+        self.all_heights = []  # (подпись, высота кадра) для всех форматов проверенного видео
+        self.h264_heights = []  # то же для H.264 (YouTube отдаёт его максимум до 1080p)
         self.checked_url = None
         self.video_title = ""
         self.settings = load_settings()
@@ -235,8 +256,12 @@ class App:
             with yt_dlp.YoutubeDL(base_opts()) as ydl:
                 info = ydl.extract_info(url, download=False)
             video = [f for f in info.get("formats", []) if f.get("vcodec") not in (None, "none") and f.get("height")]
-            heights = sorted({f["height"] for f in video}, reverse=True)
-            h264_heights = sorted({f["height"] for f in video if f["vcodec"].startswith("avc1")}, reverse=True)
+            # пары (подпись по короткой стороне, высота кадра): вертикальный 1080x1920 должен называться 1080p, а не 1920p
+            def sizes(formats):
+                return sorted({(min(f["height"], f.get("width") or f["height"]), f["height"]) for f in formats}, reverse=True)
+
+            heights = sizes(video)
+            h264_heights = sizes(f for f in video if f["vcodec"].startswith("avc1"))
             self.call_in_ui(self.on_checked, url, info.get("title", "?"), heights, h264_heights)
         except Exception as e:
             self.call_in_ui(self.show_error, f"Не удалось получить видео:\n{e}")
@@ -254,7 +279,7 @@ class App:
 
     def fill_quality_list(self):
         heights = self.h264_heights if self.edit_mode.get() else self.all_heights
-        self.heights = {f"{h}p": h for h in heights}
+        self.heights = {f"{label}p": h for label, h in heights}
         values = list(self.heights) + [AUDIO_LABEL]
         previous = self.quality.get()
         self.quality.configure(values=values)
