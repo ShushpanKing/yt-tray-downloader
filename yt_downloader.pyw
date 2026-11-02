@@ -5,6 +5,8 @@
 """
 
 import ctypes
+import json
+import os
 import socket
 import sys
 import threading
@@ -21,6 +23,7 @@ AUDIO_LABEL = "Только звук (mp3)"
 HERE = Path(__file__).parent
 # порт, по которому вторая копия программы просит первую показать окно
 INSTANCE_PORT = 47815
+SETTINGS_FILE = Path(os.environ.get("APPDATA", HERE)) / "yt_downloader" / "settings.json"
 
 # Виртуальные коды клавиш Windows: не зависят от раскладки, в отличие от keysym
 VK_A, VK_C, VK_V, VK_X = 65, 67, 86, 88
@@ -51,6 +54,21 @@ def base_opts():
     }
 
 
+def load_settings():
+    try:
+        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(settings):
+    try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_FILE.write_text(json.dumps(settings), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def claim_single_instance():
     """Возвращает слушающий сокет, если мы первая копия; иначе будит первую копию и возвращает None."""
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -72,8 +90,11 @@ class App:
     def __init__(self, root, server, start_hidden):
         self.root = root
         self.heights = {}  # подпись в списке -> высота кадра
+        self.all_heights = []  # все высоты у проверенного видео
+        self.h264_heights = []  # высоты, которые есть в H.264 (YouTube отдаёт его максимум до 1080p)
         self.checked_url = None
         self.video_title = ""
+        self.settings = load_settings()
 
         root.title(APP_NAME)
         root.resizable(False, False)
@@ -104,10 +125,16 @@ class App:
         self.download_btn = ttk.Button(frame, text="Скачать", command=self.download, state="disabled")
         self.download_btn.grid(row=4, column=1, padx=(6, 0), pady=(2, 8))
 
+        # Premiere и многие редакторы не открывают AV1/VP9, которые YouTube отдаёт по умолчанию
+        self.edit_mode = tk.BooleanVar(value=self.settings.get("edit_mode", False))
+        ttk.Checkbutton(
+            frame, text="Для монтажа (H.264, до 1080p)", variable=self.edit_mode, command=self.on_edit_mode
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
         self.progress = ttk.Progressbar(frame, length=480, maximum=100)
-        self.progress.grid(row=5, column=0, columnspan=2, sticky="we")
+        self.progress.grid(row=6, column=0, columnspan=2, sticky="we")
         self.status_var = tk.StringVar()
-        ttk.Label(frame, textvariable=self.status_var).grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(frame, textvariable=self.status_var).grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         self.tray = pystray.Icon(
             "yt_downloader",
@@ -207,25 +234,37 @@ class App:
         try:
             with yt_dlp.YoutubeDL(base_opts()) as ydl:
                 info = ydl.extract_info(url, download=False)
-            heights = sorted(
-                {f["height"] for f in info.get("formats", []) if f.get("vcodec") not in (None, "none") and f.get("height")},
-                reverse=True,
-            )
-            self.call_in_ui(self.on_checked, url, info.get("title", "?"), heights)
+            video = [f for f in info.get("formats", []) if f.get("vcodec") not in (None, "none") and f.get("height")]
+            heights = sorted({f["height"] for f in video}, reverse=True)
+            h264_heights = sorted({f["height"] for f in video if f["vcodec"].startswith("avc1")}, reverse=True)
+            self.call_in_ui(self.on_checked, url, info.get("title", "?"), heights, h264_heights)
         except Exception as e:
             self.call_in_ui(self.show_error, f"Не удалось получить видео:\n{e}")
 
-    def on_checked(self, url, title, heights):
-        self.heights = {f"{h}p": h for h in heights}
-        values = list(self.heights) + [AUDIO_LABEL]
-        self.quality.configure(values=values)
-        self.quality.set(values[0])
+    def on_checked(self, url, title, heights, h264_heights):
+        self.all_heights = heights
+        self.h264_heights = h264_heights
         self.title_var.set(title)
         self.video_title = title
         self.checked_url = url
+        self.fill_quality_list()
         self.status_var.set("")
         self.set_busy(False)
         # trace на url_var сбросит checked_url, если ссылку поменяют
+
+    def fill_quality_list(self):
+        heights = self.h264_heights if self.edit_mode.get() else self.all_heights
+        self.heights = {f"{h}p": h for h in heights}
+        values = list(self.heights) + [AUDIO_LABEL]
+        previous = self.quality.get()
+        self.quality.configure(values=values)
+        self.quality.set(previous if previous in values else values[0])
+
+    def on_edit_mode(self):
+        self.settings["edit_mode"] = self.edit_mode.get()
+        save_settings(self.settings)
+        if self.checked_url:
+            self.fill_quality_list()
 
     # --- скачивание ---
 
@@ -246,6 +285,13 @@ class App:
         if choice == AUDIO_LABEL:
             opts["format"] = "bestaudio/best"
             opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}]
+        elif self.edit_mode.get():
+            h = self.heights[choice]
+            opts["format"] = (
+                f"bestvideo[height={h}][vcodec^=avc1]+bestaudio[ext=m4a]"
+                f"/best[height<={h}][vcodec^=avc1]"
+            )
+            opts["merge_output_format"] = "mp4"
         else:
             h = self.heights[choice]
             # сначала пробуем mp4+m4a (лучше всего открывается в Windows), потом что угодно с этой высотой

@@ -25,6 +25,7 @@
 - **Real quality list.** The dropdown shows only the resolutions the video actually has, from 144p up to 4K.
 - **Audio only.** One option saves just the sound as MP3.
 - **Smart formats.** MP4 + M4A streams come first so files open anywhere on Windows. The video and audio tracks are merged automatically with ffmpeg.
+- **Editing mode.** One checkbox switches to H.264 + AAC, the format Premiere Pro and other editors import without trouble. YouTube's default AV1 and VP9 are often rejected. YouTube offers H.264 only up to 1080p, so in this mode the list stops there. The checkbox is remembered between launches.
 - **Live progress.** A progress bar with percent and megabytes downloaded.
 - **Lives in the tray.** The close button hides the window to the tray. Exit from the tray icon menu.
 - **Starts with Windows.** It can launch silently in the tray when you log in.
